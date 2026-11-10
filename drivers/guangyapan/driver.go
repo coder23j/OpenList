@@ -2,13 +2,10 @@ package guangyapan
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
-	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
@@ -24,7 +21,6 @@ import (
 const (
 	accountBaseURL = "https://account.guangyapan.com"
 	apiBaseURL     = "https://api.guangyapan.com"
-	defaultClient  = "aMe-8VSlkrbQXpUR"
 )
 
 type GuangYaPan struct {
@@ -36,7 +32,19 @@ type GuangYaPan struct {
 
 	resolvedRootFolderID string
 	rootFolderResolved   bool
+
+	// refreshMu protects concurrent access to AccessToken/RefreshToken during refresh.
+	refreshMu sync.Mutex
+	// statusTimer tracks delayed status updates for cancellation on Drop.
+	statusTimer *time.Timer
+
+	// apiRateLimit throttles requests per API endpoint so that batch operations
+	// (e.g. copying many files cross-storage) don't flood the upstream API.
+	apiRateLimit sync.Map
 }
+
+// apiRateInterval is the minimum gap between two requests to the same endpoint.
+const apiRateInterval = 500 * time.Millisecond
 
 func (d *GuangYaPan) Config() driver.Config {
 	return config
@@ -49,11 +57,15 @@ func (d *GuangYaPan) GetAddition() driver.Additional {
 func (d *GuangYaPan) Init(ctx context.Context) error {
 	d.ClientID = strings.TrimSpace(d.ClientID)
 	if d.ClientID == "" {
-		d.ClientID = defaultClient
+		return errors.New("client_id is required, please provide a valid client_id")
 	}
 	d.DeviceID = normalizeDeviceID(d.DeviceID)
 	if d.DeviceID == "" {
 		d.DeviceID = randomDeviceID()
+	}
+	deviceSign := strings.TrimSpace(d.DeviceSign)
+	if deviceSign == "" {
+		deviceSign = "wdi10." + d.DeviceID
 	}
 	if d.PageSize <= 0 {
 		d.PageSize = 100
@@ -81,7 +93,7 @@ func (d *GuangYaPan) Init(ctx context.Context) error {
 		SetHeader("Content-Type", "application/json").
 		SetHeader("X-Device-Model", "chrome%2F147.0.0.0").
 		SetHeader("X-Device-Name", "PC-Chrome").
-		SetHeader("X-Device-Sign", "wdi10."+d.DeviceID+"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx").
+		SetHeader("X-Device-Sign", deviceSign).
 		SetHeader("X-Net-Work-Type", "NONE").
 		SetHeader("X-OS-Version", "MacIntel").
 		SetHeader("X-Platform-Version", "1").
@@ -91,9 +103,6 @@ func (d *GuangYaPan) Init(ctx context.Context) error {
 		SetHeader("X-Client-Id", d.ClientID).
 		SetHeader("X-Client-Version", "0.0.1").
 		SetHeader("X-Device-Id", d.DeviceID)
-	if d.CaptchaToken != "" {
-		d.accountClient.SetHeader("X-Captcha-Token", d.CaptchaToken)
-	}
 
 	d.apiClient = base.NewRestyClient().
 		SetBaseURL(apiBaseURL).
@@ -144,6 +153,9 @@ func (d *GuangYaPan) Init(ctx context.Context) error {
 }
 
 func (d *GuangYaPan) Drop(ctx context.Context) error {
+	if d.statusTimer != nil {
+		d.statusTimer.Stop()
+	}
 	return nil
 }
 
@@ -169,19 +181,22 @@ func (d *GuangYaPan) List(ctx context.Context, dir model.Obj, args model.ListArg
 
 	parentID := dir.GetID()
 
+	const maxPage = 10000
 	res := make([]model.Obj, 0, d.PageSize)
-	for page := 0; ; page++ {
+	for page := 0; page < maxPage; page++ {
 		var resp listResp
 		body := map[string]any{
-			"parentId":  parentID,
-			"page":      page,
-			"pageSize":  d.PageSize,
-			"orderBy":   d.OrderBy,
-			"sortType":  d.SortType,
-			"fileTypes": []int{},
+			"parentId": parentID,
+			"page":     page,
+			"pageSize": d.PageSize,
+			"orderBy":  d.OrderBy,
+			"sortType": d.SortType,
 		}
 		if err := d.postAPI(ctx, "/userres/v1/file/get_file_list", body, &resp); err != nil {
 			return nil, err
+		}
+		if !isSuccessMsg(resp.Msg) {
+			return nil, fmt.Errorf("list files failed: code=%d msg=%s", resp.Code, strings.TrimSpace(resp.Msg))
 		}
 		for _, item := range resp.Data.List {
 			res = append(res, &model.Object{
@@ -248,7 +263,7 @@ func (d *GuangYaPan) MakeDir(ctx context.Context, parentDir model.Obj, dirName s
 	}, &out); err != nil {
 		return err
 	}
-	if !strings.EqualFold(strings.TrimSpace(out.Msg), "success") {
+	if !isSuccessMsg(out.Msg) {
 		return fmt.Errorf("make dir failed: %s", strings.TrimSpace(out.Msg))
 	}
 	return nil
@@ -275,7 +290,7 @@ func (d *GuangYaPan) Rename(ctx context.Context, srcObj model.Obj, newName strin
 	}, &out); err != nil {
 		return err
 	}
-	if !strings.EqualFold(strings.TrimSpace(out.Msg), "success") {
+	if !isSuccessMsg(out.Msg) {
 		return fmt.Errorf("rename failed: %s", strings.TrimSpace(out.Msg))
 	}
 	return nil
@@ -291,13 +306,13 @@ func (d *GuangYaPan) Remove(ctx context.Context, obj model.Obj) error {
 		return errors.New("file id is empty")
 	}
 
-	var del deleteResp
+	var del taskResp
 	if err := d.postAPI(ctx, "/nd.bizuserres.s/v1/file/delete_file", map[string]any{
 		"fileIds": []string{fileID},
 	}, &del); err != nil {
 		return err
 	}
-	if !strings.EqualFold(strings.TrimSpace(del.Msg), "success") {
+	if !isSuccessMsg(del.Msg) {
 		return fmt.Errorf("delete failed: %s", strings.TrimSpace(del.Msg))
 	}
 
@@ -320,14 +335,14 @@ func (d *GuangYaPan) Move(ctx context.Context, srcObj, dstDir model.Obj) error {
 	}
 	parentID := dstDir.GetID()
 
-	var out deleteResp
+	var out taskResp
 	if err := d.postAPI(ctx, "/nd.bizuserres.s/v1/file/move_file", map[string]any{
 		"fileIds":  []string{fileID},
 		"parentId": parentID,
 	}, &out); err != nil {
 		return err
 	}
-	if !strings.EqualFold(strings.TrimSpace(out.Msg), "success") {
+	if !isSuccessMsg(out.Msg) {
 		return fmt.Errorf("move failed: %s", strings.TrimSpace(out.Msg))
 	}
 	taskID := strings.TrimSpace(out.Data.TaskID)
@@ -348,14 +363,14 @@ func (d *GuangYaPan) Copy(ctx context.Context, srcObj, dstDir model.Obj) error {
 	}
 	parentID := dstDir.GetID()
 
-	var out deleteResp
+	var out taskResp
 	if err := d.postAPI(ctx, "/nd.bizuserres.s/v1/file/copy_file", map[string]any{
 		"fileIds":  []string{fileID},
 		"parentId": parentID,
 	}, &out); err != nil {
 		return err
 	}
-	if !strings.EqualFold(strings.TrimSpace(out.Msg), "success") {
+	if !isSuccessMsg(out.Msg) {
 		return fmt.Errorf("copy failed: %s", strings.TrimSpace(out.Msg))
 	}
 	taskID := strings.TrimSpace(out.Data.TaskID)
@@ -365,63 +380,97 @@ func (d *GuangYaPan) Copy(ctx context.Context, srcObj, dstDir model.Obj) error {
 	return d.waitTaskDone(ctx, taskID)
 }
 
-func (d *GuangYaPan) Put(ctx context.Context, dstDir model.Obj, file model.FileStreamer, up driver.UpdateProgress) error {
+func (d *GuangYaPan) Put(ctx context.Context, dstDir model.Obj, file model.FileStreamer, up driver.UpdateProgress) (model.Obj, error) {
 	if err := d.ensureAccessToken(ctx); err != nil {
-		return err
+		return nil, err
 	}
 	if file == nil {
-		return errors.New("file is nil")
+		return nil, errors.New("file is nil")
 	}
 	if file.GetSize() < 0 {
-		return errors.New("invalid file size")
+		return nil, errors.New("invalid file size")
 	}
 	name := strings.TrimSpace(file.GetName())
 	if name == "" {
-		return errors.New("file name is empty")
+		return nil, errors.New("file name is empty")
 	}
 
 	parentID := dstDir.GetID()
 
-	token, code, err := d.getUploadToken(ctx, parentID, name, file.GetSize())
+	// 优先秒传：先计算文件 MD5，后端命中相同文件时直接秒传完成，无需真实上传。
+	md5sum, err := d.fileMD5(file, up)
 	if err != nil {
-		return err
+		return nil, err
+	}
+
+	token, code, err := d.getUploadToken(ctx, parentID, name, file.GetSize(), md5sum)
+	if err != nil {
+		return nil, err
 	}
 	taskID := strings.TrimSpace(token.TaskID)
-	if code == 156 {
+	// code == 156 (instant upload) or AlreadyDone mean the backend has already
+	// finished/imported the file; there is no OSS upload to perform.
+	if code == 156 || token.AlreadyDone {
 		if taskID == "" {
-			return errors.New("instant upload returns empty task id")
+			return nil, errors.New("instant upload returns empty task id")
 		}
-		return d.waitUploadTaskInfo(ctx, taskID)
+		if err := d.waitUploadTaskInfo(ctx, taskID); err != nil {
+			return nil, err
+		}
+		return nil, nil
 	}
 
 	if token.ObjectPath == "" || token.BucketName == "" || token.EndPoint == "" || token.AccessKeyID == "" || token.SecretAccessKey == "" {
-		return errors.New("upload token is incomplete")
+		return nil, errors.New("upload token is incomplete")
 	}
 
 	ossEndpoint := normalizeOSSEndpoint(token.EndPoint, token.BucketName)
 	client, err := oss.New(ossEndpoint, token.AccessKeyID, token.SecretAccessKey, oss.SecurityToken(token.SessionToken))
 	if err != nil {
-		return fmt.Errorf("create oss client failed: %w", err)
+		return nil, fmt.Errorf("create oss client failed: %w", err)
 	}
 	bucket, err := client.Bucket(token.BucketName)
 	if err != nil {
-		return fmt.Errorf("create oss bucket failed: %w", err)
+		return nil, fmt.Errorf("create oss bucket failed: %w", err)
 	}
 
 	if file.GetSize() == 0 {
 		if err := bucket.PutObject(token.ObjectPath, strings.NewReader("")); err != nil {
-			return err
+			return nil, err
 		}
 	} else {
 		if err := d.multipartUploadToOSS(ctx, bucket, token.ObjectPath, file, up); err != nil {
-			return err
+			return nil, err
 		}
 	}
 
 	if taskID == "" {
-		return nil
+		return nil, nil
 	}
-	return d.waitUploadTaskInfo(ctx, taskID)
+	if err := d.waitUploadTaskInfo(ctx, taskID); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+
+func (d *GuangYaPan) GetDetails(ctx context.Context) (*model.StorageDetails, error) {
+	if err := d.ensureAccessToken(ctx); err != nil {
+		return nil, err
+	}
+
+	var resp assetsInfoResp
+	if err := d.postAPI(ctx, "/nd.bizassets.s/v1/get_assets", nil, &resp); err != nil {
+		return nil, err
+	}
+	if resp.IsSuccess() && resp.Data.TotalSpaceSize > 0 {
+		return &model.StorageDetails{
+			DiskUsage: model.DiskUsage{
+				TotalSpace: resp.Data.TotalSpaceSize,
+				UsedSpace:  resp.Data.UsedSpaceSize,
+			},
+		}, nil
+	}
+	return nil, errors.New("failed to get storage details")
 }
 
 func (d *GuangYaPan) getRootFolderID(ctx context.Context) (string, error) {
@@ -481,19 +530,22 @@ func (d *GuangYaPan) findChildFolderID(ctx context.Context, parentID, name strin
 		pageSize = 100
 	}
 
+	const maxPage = 10000
 	seen := 0
-	for page := 0; ; page++ {
+	for page := 0; page < maxPage; page++ {
 		var resp listResp
 		body := map[string]any{
-			"parentId":  parentID,
-			"page":      page,
-			"pageSize":  pageSize,
-			"orderBy":   d.OrderBy,
-			"sortType":  d.SortType,
-			"fileTypes": []int{},
+			"parentId": parentID,
+			"page":     page,
+			"pageSize": pageSize,
+			"orderBy":  d.OrderBy,
+			"sortType": d.SortType,
 		}
 		if err := d.postAPI(ctx, "/nd.bizuserres.s/v1/file/get_file_list", body, &resp); err != nil {
 			return "", err
+		}
+		if !isSuccessMsg(resp.Msg) {
+			return "", fmt.Errorf("list files failed: code=%d msg=%s", resp.Code, strings.TrimSpace(resp.Msg))
 		}
 		for _, item := range resp.Data.List {
 			seen++
@@ -520,13 +572,7 @@ func (d *GuangYaPan) ensureAccessToken(ctx context.Context) error {
 		return nil
 	}
 	if strings.TrimSpace(d.RefreshToken) == "" {
-		if d.canSMSLogin() {
-			return d.loginBySMSCode(ctx)
-		}
-		if d.PhoneNumber != "" {
-			return errors.New("not logged in yet: please fill verify_code and save storage to finish SMS login")
-		}
-		return errors.New("access token is empty")
+		return errors.New("not logged in, please re-init storage")
 	}
 	return d.refreshToken(ctx)
 }
@@ -553,6 +599,16 @@ func (d *GuangYaPan) validateToken(ctx context.Context) error {
 func (d *GuangYaPan) refreshToken(ctx context.Context) error {
 	if strings.TrimSpace(d.RefreshToken) == "" {
 		return errors.New("refresh_token is empty")
+	}
+
+	d.refreshMu.Lock()
+	defer d.refreshMu.Unlock()
+
+	// Double-check after acquiring lock (may have been refreshed by another goroutine)
+	if strings.TrimSpace(d.AccessToken) != "" {
+		if err := d.validateToken(ctx); err == nil {
+			return nil
+		}
 	}
 
 	var out tokenResp
@@ -665,13 +721,13 @@ func (d *GuangYaPan) prepareSMSCode(ctx context.Context) error {
 }
 
 func (d *GuangYaPan) requestVerificationID(ctx context.Context) (string, error) {
+	req := d.accountClient.R().SetContext(ctx)
 	if d.CaptchaToken != "" {
-		d.accountClient.SetHeader("X-Captcha-Token", d.CaptchaToken)
+		req.SetHeader("X-Captcha-Token", d.CaptchaToken)
 	}
 
 	var step1 verificationResp
-	resp, err := d.accountClient.R().
-		SetContext(ctx).
+	resp, err := req.
 		SetBody(map[string]any{
 			"phone_number": normalizePhoneE164(d.PhoneNumber),
 			"target":       "ANY",
@@ -696,13 +752,15 @@ func (d *GuangYaPan) requestVerificationID(ctx context.Context) (string, error) 
 
 func (d *GuangYaPan) ensureCaptchaToken(ctx context.Context, force bool) error {
 	if !force && d.CaptchaToken != "" {
-		d.accountClient.SetHeader("X-Captcha-Token", d.CaptchaToken)
 		return nil
 	}
 
 	var out captchaInitResp
-	resp, err := d.accountClient.R().
-		SetContext(ctx).
+	req := d.accountClient.R().SetContext(ctx)
+	if d.CaptchaToken != "" {
+		req.SetHeader("X-Captcha-Token", d.CaptchaToken)
+	}
+	resp, err := req.
 		SetBody(map[string]any{
 			"client_id": d.ClientID,
 			"action":    "POST:/v1/auth/verification",
@@ -722,330 +780,19 @@ func (d *GuangYaPan) ensureCaptchaToken(ctx context.Context, force bool) error {
 		return fmt.Errorf("init captcha token failed: %s", d.accountErr(out.ErrorDesc, out.Error, resp))
 	}
 	d.CaptchaToken = strings.TrimSpace(out.CaptchaToken)
-	d.accountClient.SetHeader("X-Captcha-Token", d.CaptchaToken)
 	op.MustSaveDriverStorage(d)
 	return nil
 }
 
-func normalizeCaptchaUsername(phone string) string {
-	p := strings.TrimSpace(phone)
-	p = strings.ReplaceAll(p, " ", "")
-	p = strings.TrimPrefix(p, "+")
-	// Keep only digits.
-	b := make([]rune, 0, len(p))
-	for _, ch := range p {
-		if ch >= '0' && ch <= '9' {
-			b = append(b, ch)
-		}
-	}
-	digits := string(b)
-	// Mainland number normalization: +86xxxxxxxxxxx -> xxxxxxxxxxx
-	if strings.HasPrefix(digits, "86") && len(digits) > 11 {
-		digits = digits[2:]
-	}
-	return digits
-}
-
-func normalizePhoneE164(phone string) string {
-	p := strings.TrimSpace(phone)
-	if p == "" {
-		return ""
-	}
-	p = strings.ReplaceAll(p, " ", "")
-	if strings.HasPrefix(p, "+") {
-		// Format as "+86 1xxxxxxxxxx" to match browser payload expectations.
-		if strings.HasPrefix(p, "+86") && len(p) > 3 {
-			rest := strings.TrimPrefix(p, "+86")
-			return "+86 " + rest
-		}
-		return p
-	}
-	// If raw mainland number is provided, normalize with +86 prefix.
-	digits := normalizeCaptchaUsername(p)
-	if len(digits) == 11 {
-		return "+86 " + digits
-	}
-	return p
-}
-
-func (d *GuangYaPan) setTempStatus(status string) {
-	// initStorage sets status to WORK after Init returns, so we update it shortly after.
-	time.AfterFunc(200*time.Millisecond, func() {
-		d.GetStorage().SetStatus(status)
-		op.MustSaveDriverStorage(d)
-	})
-}
-
-func (d *GuangYaPan) accountErr(desc, short string, resp *resty.Response) string {
-	msg := strings.TrimSpace(desc)
-	if msg == "" {
-		msg = strings.TrimSpace(short)
-	}
-	if msg == "" && resp != nil {
-		msg = strings.TrimSpace(resp.String())
-	}
-	if msg == "" && resp != nil {
-		msg = fmt.Sprintf("status=%d", resp.StatusCode())
-	}
-	if msg == "" {
-		msg = "unknown error"
-	}
-	return msg
-}
-
-func (d *GuangYaPan) postAPI(ctx context.Context, path string, body any, out any) error {
-	if strings.TrimSpace(d.AccessToken) == "" {
-		return errors.New("access token is empty")
-	}
-	resp, err := d.apiClient.R().
-		SetContext(ctx).
-		SetHeader("Authorization", "Bearer "+d.AccessToken).
-		SetBody(body).
-		SetResult(out).
-		Post(path)
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode() == 401 || resp.StatusCode() == 403 {
-		if strings.TrimSpace(d.RefreshToken) == "" {
-			return fmt.Errorf("request failed: status=%d body=%s", resp.StatusCode(), resp.String())
-		}
-		if err := d.refreshToken(ctx); err != nil {
-			return err
-		}
-		resp, err = d.apiClient.R().
-			SetContext(ctx).
-			SetHeader("Authorization", "Bearer "+d.AccessToken).
-			SetBody(body).
-			SetResult(out).
-			Post(path)
-		if err != nil {
-			return err
-		}
-	}
-	if resp.IsError() {
-		return fmt.Errorf("request failed: status=%d body=%s", resp.StatusCode(), resp.String())
-	}
-	return nil
-}
-
-func (d *GuangYaPan) waitTaskDone(ctx context.Context, taskID string) error {
-	const (
-		maxTry   = 30
-		interval = 300 * time.Millisecond
-	)
-	for i := 0; i < maxTry; i++ {
-		var out taskStatusResp
-		if err := d.postAPI(ctx, "/nd.bizuserres.s/v1/get_task_status", map[string]any{
-			"taskId": taskID,
-		}, &out); err != nil {
-			return err
-		}
-		if !strings.EqualFold(strings.TrimSpace(out.Msg), "success") {
-			return fmt.Errorf("get task status failed: %s", strings.TrimSpace(out.Msg))
-		}
-		switch out.Data.Status {
-		case 2:
-			return nil
-		case -1, 3:
-			return fmt.Errorf("task %s failed with status=%d", taskID, out.Data.Status)
-		}
-		if i == maxTry-1 {
-			break
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(interval):
-		}
-	}
-	return fmt.Errorf("task %s timeout", taskID)
-}
-
-func (d *GuangYaPan) getUploadToken(ctx context.Context, parentID, name string, size int64) (*uploadTokenData, int, error) {
-	var out uploadTokenResp
-	err := d.postAPI(ctx, "/nd.bizuserres.s/v1/get_res_center_token", map[string]any{
-		"capacity": 2,
-		"name":     name,
-		"parentId": parentID,
-		"res": map[string]any{
-			"fileSize": size,
-		},
-	}, &out)
-	if err != nil {
-		return nil, 0, err
-	}
-	msg := strings.TrimSpace(out.Msg)
-	if msg != "" && !strings.EqualFold(msg, "success") {
-		return nil, out.Code, fmt.Errorf("get upload token failed: %s", msg)
-	}
-	if out.Data.TaskID == "" {
-		return nil, out.Code, errors.New("get upload token failed: empty task id")
-	}
-	if out.Data.AccessKeyID == "" {
-		out.Data.AccessKeyID = out.Data.Creds.AccessKeyID
-	}
-	if out.Data.SecretAccessKey == "" {
-		out.Data.SecretAccessKey = out.Data.Creds.SecretAccessKey
-	}
-	if out.Data.SessionToken == "" {
-		out.Data.SessionToken = out.Data.Creds.SessionToken
-	}
-	if strings.TrimSpace(out.Data.EndPoint) == "" {
-		out.Data.EndPoint = strings.TrimSpace(out.Data.FullEndPoint)
-	}
-	if strings.TrimSpace(out.Data.EndPoint) != "" && !strings.HasPrefix(out.Data.EndPoint, "http://") && !strings.HasPrefix(out.Data.EndPoint, "https://") {
-		if strings.TrimSpace(out.Data.FullEndPoint) != "" {
-			out.Data.EndPoint = strings.TrimSpace(out.Data.FullEndPoint)
-		} else if strings.TrimSpace(out.Data.BucketName) != "" {
-			host := strings.TrimSpace(out.Data.EndPoint)
-			prefix := strings.TrimSpace(out.Data.BucketName) + "."
-			if strings.HasPrefix(host, prefix) {
-				out.Data.EndPoint = "https://" + host
-			} else {
-				out.Data.EndPoint = "https://" + strings.TrimSpace(out.Data.BucketName) + "." + host
-			}
-		} else {
-			out.Data.EndPoint = "https://" + strings.TrimSpace(out.Data.EndPoint)
-		}
-	}
-	return &out.Data, out.Code, nil
-}
-
-func (d *GuangYaPan) waitUploadTaskInfo(ctx context.Context, taskID string) error {
-	const (
-		maxTry   = 300
-		interval = 1 * time.Second
-	)
-	for i := 0; i < maxTry; i++ {
-		var out taskInfoResp
-		if err := d.postAPI(ctx, "/nd.bizuserres.s/v1/file/get_info_by_task_id", map[string]any{
-			"taskId": taskID,
-		}, &out); err != nil {
-			return err
-		}
-		if out.Data.FileID != "" {
-			return nil
-		}
-		switch out.Code {
-		case 145, 146, 147, 155, 163, 0:
-			// uploading/verifying/processing
-		default:
-			if strings.TrimSpace(out.Msg) != "" {
-				return fmt.Errorf("upload task failed: code=%d msg=%s", out.Code, strings.TrimSpace(out.Msg))
-			}
-		}
-		if i == maxTry-1 {
-			break
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(interval):
-		}
-	}
-	return fmt.Errorf("upload task %s timeout", taskID)
-}
-
-func (d *GuangYaPan) multipartUploadToOSS(ctx context.Context, bucket *oss.Bucket, objectPath string, file model.FileStreamer, up driver.UpdateProgress) error {
-	partSize := calcUploadPartSize(file.GetSize())
-	imur, err := bucket.InitiateMultipartUpload(objectPath, oss.Sequential())
-	if err != nil {
-		return err
-	}
-
-	total := file.GetSize()
-	partCount := int((total + partSize - 1) / partSize)
-	parts := make([]oss.UploadPart, 0, partCount)
-	var uploaded int64
-	partNumber := 1
-
-	for uploaded < total {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		curPartSize := partSize
-		left := total - uploaded
-		if left < curPartSize {
-			curPartSize = left
-		}
-
-		reader := io.LimitReader(file, curPartSize)
-		part, err := bucket.UploadPart(imur, driver.NewLimitedUploadStream(ctx, reader), curPartSize, partNumber)
-		if err != nil {
-			return err
-		}
-		parts = append(parts, part)
-		uploaded += curPartSize
-		partNumber++
-		if total > 0 {
-			up(100 * float64(uploaded) / float64(total))
-		}
-	}
-
-	_, err = bucket.CompleteMultipartUpload(imur, parts)
-	return err
-}
-
-func calcUploadPartSize(size int64) int64 {
-	const (
-		mb = int64(1024 * 1024)
-		gb = int64(1024 * 1024 * 1024)
-	)
-	switch {
-	case size <= 100*mb:
-		return 1 * mb
-	case size <= 16*gb:
-		return 2 * mb
-	case size <= 160*gb:
-		return 4 * mb
-	default:
-		return 8 * mb
-	}
-}
-
-func normalizeOSSEndpoint(endpoint, bucket string) string {
-	ep := strings.TrimSpace(endpoint)
-	if ep == "" {
-		return ep
-	}
-	if !strings.HasPrefix(ep, "http://") && !strings.HasPrefix(ep, "https://") {
-		ep = "https://" + ep
-	}
-	u, err := url.Parse(ep)
-	if err != nil || u.Host == "" {
-		return ep
-	}
-	host := u.Host
-	prefix := strings.TrimSpace(bucket)
-	if prefix != "" && strings.HasPrefix(host, prefix+".") {
-		host = strings.TrimPrefix(host, prefix+".")
-	}
-	u.Host = host
-	return u.String()
-}
-
-func normalizeDeviceID(v string) string {
-	v = strings.ToLower(strings.TrimSpace(v))
-	v = strings.ReplaceAll(v, "-", "")
-	if len(v) != 32 {
-		return ""
-	}
-	for _, ch := range v {
-		if (ch < '0' || ch > '9') && (ch < 'a' || ch > 'f') {
-			return ""
-		}
-	}
-	return v
-}
-
-func randomDeviceID() string {
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
-		return "0123456789abcdef0123456789abcdef"
-	}
-	return hex.EncodeToString(b)
-}
-
-var _ driver.Driver = (*GuangYaPan)(nil)
-var _ driver.GetRooter = (*GuangYaPan)(nil)
+// Interface compliance checks
+var (
+	_ driver.Driver      = (*GuangYaPan)(nil)
+	_ driver.GetRooter   = (*GuangYaPan)(nil)
+	_ driver.Mkdir       = (*GuangYaPan)(nil)
+	_ driver.Move        = (*GuangYaPan)(nil)
+	_ driver.Copy        = (*GuangYaPan)(nil)
+	_ driver.Rename      = (*GuangYaPan)(nil)
+	_ driver.Remove      = (*GuangYaPan)(nil)
+	_ driver.PutResult   = (*GuangYaPan)(nil)
+	_ driver.WithDetails = (*GuangYaPan)(nil)
+)

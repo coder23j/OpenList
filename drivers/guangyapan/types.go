@@ -84,7 +84,8 @@ type commonResp struct {
 	Msg  string `json:"msg"`
 }
 
-type deleteResp struct {
+// taskResp is used for async operations (delete, move, copy) that return a task ID.
+type taskResp struct {
 	Code int    `json:"code"`
 	Msg  string `json:"msg"`
 	Data struct {
@@ -108,6 +109,7 @@ type uploadTokenResp struct {
 
 type uploadTokenData struct {
 	TaskID          string `json:"taskId"`
+	AlreadyDone     bool   `json:"-"`
 	ObjectPath      string `json:"objectPath"`
 	Provider        any    `json:"provider"`
 	Region          string `json:"region"`
@@ -132,6 +134,22 @@ type taskInfoResp struct {
 		FileID string `json:"fileId"`
 	} `json:"data"`
 }
+
+// assetsInfoResp is the response for storage details query.
+type assetsInfoResp struct {
+	Code int    `json:"code"`
+	Msg  string `json:"msg"`
+	Data struct {
+		TotalSpaceSize int64 `json:"totalSpaceSize"`
+		UsedSpaceSize  int64 `json:"usedSpaceSize"`
+	} `json:"data"`
+}
+
+func (r assetsInfoResp) IsSuccess() bool {
+	return isSuccessMsg(r.Msg)
+}
+
+// Offline download types
 
 type offlineResolveResp struct {
 	Code int                `json:"code"`
